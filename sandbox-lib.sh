@@ -38,14 +38,17 @@ require_podman() {
 }
 
 image_exists() {
+    [ -n "${1:-}" ] || { err "image_exists: missing argument"; return 2; }
     podman image exists "$1" 2>/dev/null
 }
 
 container_exists() {
+    [ -n "${1:-}" ] || { err "container_exists: missing argument"; return 2; }
     podman container exists "$1" 2>/dev/null
 }
 
 volume_exists() {
+    [ -n "${1:-}" ] || { err "volume_exists: missing argument"; return 2; }
     podman volume exists "$1" 2>/dev/null
 }
 

@@ -227,12 +227,15 @@ squid -f "$SQUID_CONF" -z --foreground 2>/dev/null || true
 squid -f "$SQUID_CONF" -NYC &
 SQUID_PID=$!
 
+SQUID_READY=0
 for _ in $(seq 1 30); do
     if curl -sf -o /dev/null --proxy http://127.0.0.1:3128 http://ports.ubuntu.com 2>/dev/null; then
+        SQUID_READY=1
         break
     fi
     sleep 0.2
 done
+[ "$SQUID_READY" -eq 0 ] && echo "[entrypoint] WARNING: squid did not become reachable in 6s — network access may be broken" >&2
 
 # --- nftables ---
 nft -f "$NFT_CONF" 2>/dev/null || true
@@ -347,12 +350,15 @@ squid -f "$SQUID_CONF" -z --foreground 2>/dev/null || true
 squid -f "$SQUID_CONF" -NYC &
 SQUID_PID=$!
 
+SQUID_READY=0
 for _ in $(seq 1 30); do
     if curl -sf -o /dev/null --proxy http://127.0.0.1:3128 http://ports.ubuntu.com 2>/dev/null; then
+        SQUID_READY=1
         break
     fi
     sleep 0.2
 done
+[ "$SQUID_READY" -eq 0 ] && echo "[entrypoint] WARNING: squid did not become reachable in 6s — network access may be broken" >&2
 
 # --- nftables ---
 nft -f "$NFT_CONF" 2>/dev/null || true
@@ -458,12 +464,15 @@ squid -f "$SQUID_CONF" -z --foreground 2>/dev/null || true
 squid -f "$SQUID_CONF" -NYC &
 SQUID_PID=$!
 
+SQUID_READY=0
 for _ in $(seq 1 30); do
     if curl -sf -o /dev/null --proxy http://127.0.0.1:3128 http://ports.ubuntu.com 2>/dev/null; then
+        SQUID_READY=1
         break
     fi
     sleep 0.2
 done
+[ "$SQUID_READY" -eq 0 ] && echo "[entrypoint] WARNING: squid did not become reachable in 6s — network access may be broken" >&2
 
 # --- nftables ---
 nft -f "$NFT_CONF" 2>/dev/null || true
@@ -768,10 +777,15 @@ cmd_status() {
     if [ -n "$containers" ]; then
         echo "   Containers:"
         echo "$containers" | while IFS=$'\t' read -r name state created; do
+            # SANDBOX_NETWORK is set by run_container starting in v1.1; older
+            # containers (or anything started outside this CLI) won't have it.
+            local mode
+            mode=$(podman inspect "$name" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+                   | grep '^SANDBOX_NETWORK=' | cut -d= -f2)
             if [ "$state" = "running" ]; then
-                ok "  $name ($state, $created)"
+                ok "  $name (mode: ${mode:-unknown}, $state, $created)"
             else
-                warn "  $name ($state, $created)"
+                warn "  $name (mode: ${mode:-unknown}, $state, $created)"
             fi
         done
     else
@@ -842,6 +856,9 @@ run_container() {
         sysctl_args+=(--sysctl "net.ipv6.conf.default.disable_ipv6=1")
     fi
 
+    # SANDBOX_PROJECT is the canonical name (since v1.1). CLAUDE_PROJECT is
+    # kept as a compat alias for one release for any in-container scripts that
+    # still read the old name; planned for removal in v1.2.
     # shellcheck disable=SC2086  # word-splitting on $exec_cmd is intentional: it may be a multi-token command
     podman run --rm -it \
         --name "$ctr_name" \
@@ -851,6 +868,7 @@ run_container() {
         "${sysctl_args[@]+"${sysctl_args[@]}"}" \
         -v "${project_path}:/workspace:rw" \
         -v "${agent_volume}:${agent_config_dir}:rw" \
+        -e "SANDBOX_PROJECT=${project_name}" \
         -e "CLAUDE_PROJECT=${project_name}" \
         -e "SANDBOX_NETWORK=${NETWORK:-locked}" \
         "$agent_image" \

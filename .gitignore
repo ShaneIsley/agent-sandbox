@@ -7,12 +7,12 @@ agent-sandbox-build/
 claude-sandbox
 pi-sandbox
 gemini-sandbox
-
 # Test/scratch directories — stray artifacts from interactive shell sessions
 test-instance-dir/
-
 # OS / editor noise
 .DS_Store
 *.swp
 *.swo
 *~
+HANDOFF.md
+IMPROVEMENTS.md

@@ -298,10 +298,10 @@ build_base_image() {
     ok "Base image: ${image_name}:${image_tag}"
 }
 
-# ── Entrypoint template (UNUSED — see IMPROVEMENTS.md item #1) ───────────────
+# ── Entrypoint template (UNUSED — kept for compat) ──────────────────────────
 # Currently dead code: agent-sandbox writes its own three entrypoint heredocs
 # inline rather than calling this helper. Kept for now to avoid breaking any
-# downstream consumers; see IMPROVEMENTS.md for the consolidation plan.
+# downstream consumers; consolidation is planned but not yet scheduled.
 
 write_entrypoint() {
     local output_path="$1"

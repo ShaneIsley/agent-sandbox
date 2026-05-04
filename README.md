@@ -1,5 +1,18 @@
 # agent-sandbox
 
+```bash
+    ___________________
+   /                  /|
+  /   >_ AGENT       / |
+ /      SANDBOX     /  |
+/__________________/   |
+|      _______     |   |
+|     |       |    |   |
+|     |  [🔐] |    |   /
+|     |_______|    | /
+|__________________|/
+```
+
 A reproducible Podman-based sandbox for running coding agents (Claude Code, pi-coding-agent, gemini-cli) on macOS with strong filesystem and network isolation.
 
 The agent runs inside a container that can only see the project directory you mount, can only reach a configurable set of network destinations via a forced HTTP/HTTPS proxy, and cannot alter its own firewall rules. OAuth tokens persist across container rebuilds in per-agent Podman volumes.

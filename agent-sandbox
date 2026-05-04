@@ -1,0 +1,969 @@
+#!/bin/bash
+# agent-sandbox — Podman container sandbox for agentic coding tools
+#
+# Symlink as <agent>-sandbox to avoid --agent flag:
+#   ln -s agent-sandbox claude-sandbox
+#   ln -s agent-sandbox pi-sandbox
+#   claude-sandbox run ~/my-project
+#   pi-sandbox shell ~/my-project
+#
+# Or use the base script with --agent:
+#   agent-sandbox run ~/my-project --agent claude
+#
+# Each agent gets its own image (layered on a shared base) with only the
+# domains and packages it needs. No agent sees permissions meant for another.
+#
+# Network modes (--network=locked|open, default locked):
+#   locked  Default-deny allowlist; only per-agent domains reachable.
+#   open    Public internet allowed; private networks denied at squid AND
+#           nftables. IPv6 stack disabled in container.
+#
+# Depends on: sandbox-lib.sh (must be in the same directory)
+
+set -uo pipefail
+
+# ── Source shared library ────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB="${SCRIPT_DIR}/sandbox-lib.sh"
+if [[ ! -f "$LIB" ]]; then
+    echo "ERROR: sandbox-lib.sh not found in ${SCRIPT_DIR}" >&2
+    exit 1
+fi
+# shellcheck source=sandbox-lib.sh
+source "$LIB"
+
+# ── Config ──────────────────────────────────────────────────────────────────
+IMAGE_BASE="agent-sandbox-base"
+IMAGE_PREFIX="agent-sandbox"
+IMAGE_TAG="latest"
+CONTAINER_PREFIX="sandbox"
+BUILD_DIR="${SCRIPT_DIR}/agent-sandbox-build"
+
+# ── Agent Profiles ──────────────────────────────────────────────────────────
+
+agent_get() {
+    local agent="$1" field="$2"
+    case "${agent}::${field}" in
+        claude::package)     echo "@anthropic-ai/claude-code@latest" ;;
+        claude::command)     echo "claude" ;;
+        claude::config_dir)  echo "/home/agent/.claude" ;;
+        claude::config_file) echo "/home/agent/.claude.json" ;;
+        claude::volume)      echo "claude-sandbox-auth" ;;
+        claude::env_unset)   echo "ANTHROPIC_API_KEY" ;;
+        claude::image)       echo "${IMAGE_PREFIX}-claude:${IMAGE_TAG}" ;;
+        claude::ports)       echo "" ;;
+
+        pi::package)         echo "@mariozechner/pi-coding-agent@latest" ;;
+        pi::command)         echo "pi" ;;
+        pi::config_dir)      echo "/home/agent/.pi" ;;
+        pi::config_file)     echo "" ;;
+        pi::volume)          echo "pi-sandbox-auth" ;;
+        pi::env_unset)       echo "" ;;
+        pi::image)           echo "${IMAGE_PREFIX}-pi:${IMAGE_TAG}" ;;
+        pi::ports)           echo "8085" ;;
+
+        gemini::package)     echo "@google/gemini-cli@latest" ;;
+        gemini::command)     echo "gemini" ;;
+        gemini::config_dir)  echo "/home/agent/.gemini" ;;
+        gemini::config_file) echo "" ;;
+        gemini::volume)      echo "gemini-sandbox-auth" ;;
+        gemini::env_unset)   echo "" ;;
+        gemini::image)       echo "${IMAGE_PREFIX}-gemini:${IMAGE_TAG}" ;;
+        gemini::ports)       echo "8085" ;;
+
+        *)
+            err "Unknown agent field: ${agent}::${field}"
+            return 1
+            ;;
+    esac
+}
+
+KNOWN_AGENTS="claude pi gemini"
+KNOWN_NETWORKS="locked open"
+
+validate_agent() {
+    local agent="$1"
+    for a in $KNOWN_AGENTS; do
+        [ "$a" = "$agent" ] && return 0
+    done
+    err "Unknown agent: $agent (known: $KNOWN_AGENTS)"
+    exit 1
+}
+
+validate_network() {
+    local mode="$1"
+    for n in $KNOWN_NETWORKS; do
+        [ "$n" = "$mode" ] && return 0
+    done
+    err "Invalid --network: $mode (must be one of: $KNOWN_NETWORKS)"
+    exit 1
+}
+
+# ── Detect agent from script name ───────────────────────────────────────────
+DETECTED_AGENT=""
+_invoked_as="$(basename "$0" .sh)"
+for _a in $KNOWN_AGENTS; do
+    if [ "$_invoked_as" = "${_a}-sandbox" ]; then
+        DETECTED_AGENT="$_a"
+        break
+    fi
+done
+unset _invoked_as _a
+
+# ── Agent-specific helpers ──────────────────────────────────────────────────
+
+parse_agent_flag() {
+    AGENT=""
+    NETWORK="locked"
+    REMAINING_ARGS=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --agent)
+                if [ -z "${2:-}" ]; then
+                    err "--agent requires a value ($KNOWN_AGENTS)"
+                    exit 1
+                fi
+                AGENT="$2"
+                shift 2
+                ;;
+            --agent=*)
+                AGENT="${1#--agent=}"
+                shift
+                ;;
+            --network)
+                if [ -z "${2:-}" ]; then
+                    err "--network requires a value ($KNOWN_NETWORKS)"
+                    exit 1
+                fi
+                NETWORK="$2"
+                shift 2
+                ;;
+            --network=*)
+                NETWORK="${1#--network=}"
+                shift
+                ;;
+            *)
+                REMAINING_ARGS+=("$1")
+                shift
+                ;;
+        esac
+    done
+    if [ -z "$AGENT" ]; then
+        AGENT="$DETECTED_AGENT"
+    fi
+    if [ -z "$AGENT" ]; then
+        err "Cannot determine agent. Use --agent NAME or invoke as <agent>-sandbox."
+        exit 1
+    fi
+    validate_agent "$AGENT"
+    validate_network "$NETWORK"
+}
+
+# ── Build context ───────────────────────────────────────────────────────────
+
+write_build_context() {
+    mkdir -p "$BUILD_DIR"/{claude,pi,gemini}
+
+    # Shared base image (from sandbox-lib.sh)
+    write_base_build_context "$BUILD_DIR"
+
+    # ========================================================================
+    # CLAUDE IMAGE
+    # ========================================================================
+
+    cat > "${BUILD_DIR}/claude/Dockerfile" << DOCKERFILE
+FROM ${IMAGE_BASE}:${IMAGE_TAG}
+
+# Temporarily unset proxy for npm install (squid not running during build)
+RUN env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \\
+    npm install -g @anthropic-ai/claude-code@latest
+
+COPY domains.txt /etc/squid/domains.txt
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+DOCKERFILE
+
+    cat > "${BUILD_DIR}/claude/domains.txt" << 'DOMAINS'
+# Claude API + auth
+.anthropic.com
+.claude.ai
+platform.claude.com
+# Git
+.github.com
+.githubusercontent.com
+# Python packages
+pypi.org
+files.pythonhosted.org
+# Astral (uv, ruff)
+astral.sh
+# npm
+registry.npmjs.org
+# Rust
+crates.io
+static.crates.io
+# apt
+ports.ubuntu.com
+archive.ubuntu.com
+security.ubuntu.com
+DOMAINS
+
+    cat > "${BUILD_DIR}/claude/entrypoint.sh" << 'ENTRYPOINT'
+#!/bin/bash
+# --- Network mode selection (validated; fail closed) ---
+case "${SANDBOX_NETWORK:-locked}" in
+    locked) SQUID_CONF=/etc/squid-locked.conf  ; NFT_CONF=/etc/nftables-locked.conf ;;
+    open)   SQUID_CONF=/etc/squid-open.conf    ; NFT_CONF=/etc/nftables-open.conf ;;
+    *)      echo "[entrypoint] FATAL: invalid SANDBOX_NETWORK='${SANDBOX_NETWORK}'" >&2
+            echo "[entrypoint] Must be 'locked' or 'open'. Refusing to start." >&2
+            exit 1 ;;
+esac
+
+# --- Squid proxy ---
+mkdir -p /run/squid /var/log/squid
+chown proxy:proxy /run/squid /var/log/squid
+squid -f "$SQUID_CONF" -z --foreground 2>/dev/null || true
+squid -f "$SQUID_CONF" -NYC &
+SQUID_PID=$!
+
+for _ in $(seq 1 30); do
+    if curl -sf -o /dev/null --proxy http://127.0.0.1:3128 http://ports.ubuntu.com 2>/dev/null; then
+        break
+    fi
+    sleep 0.2
+done
+
+# --- nftables ---
+nft -f "$NFT_CONF" 2>/dev/null || true
+
+# --- Claude auth persistence ---
+if [ -d /home/agent/.claude ]; then
+    chown -R agent:agent /home/agent/.claude
+fi
+if [ ! -L /home/agent/.claude.json ]; then
+    [ -f /home/agent/.claude.json ] && mv /home/agent/.claude.json /home/agent/.claude/.claude.json
+    ln -sf /home/agent/.claude/.claude.json /home/agent/.claude.json
+    chown -h agent:agent /home/agent/.claude.json
+fi
+
+# Force subscription auth
+unset ANTHROPIC_API_KEY
+
+# --- Prompt (visual indicator for open mode; user can override) ---
+COLORS=(31 32 33 34 35 36 91 92 93 94 95 96)
+CLR=${COLORS[$((RANDOM % ${#COLORS[@]}))]}
+NETMODE_TAG=""
+if [ "${SANDBOX_NETWORK:-locked}" = "open" ]; then
+    NETMODE_TAG="\\[\\033[1;31m\\][OPEN]\\[\\033[0m\\] "
+fi
+echo "# SANDBOX_NETWORK=${SANDBOX_NETWORK:-locked} — override PS1 below to taste" \
+    >> /home/agent/.bashrc
+echo "PS1='${NETMODE_TAG}\\[\\033[1;${CLR}m\\]claude@\\h\\[\\033[0m\\]:\\[\\033[1;34m\\]\\w\\[\\033[0m\\]\\$ '" \
+    >> /home/agent/.bashrc
+echo "export SANDBOX_NETWORK=${SANDBOX_NETWORK:-locked}" >> /home/agent/.bashrc
+
+# --- Shutdown ---
+cleanup() { kill "$SQUID_PID" 2>/dev/null; wait "$SQUID_PID" 2>/dev/null; exit 0; }
+trap cleanup SIGTERM SIGINT
+
+# --- Exec ---
+CMD="${*:-/bin/bash}"
+exec sudo -u agent --preserve-env=HTTP_PROXY,HTTPS_PROXY,http_proxy,https_proxy,NO_PROXY,no_proxy \
+    env HOME=/home/agent \
+    bash -c "cd /workspace && $CMD"
+ENTRYPOINT
+
+    # ========================================================================
+    # PI IMAGE
+    # ========================================================================
+
+    cat > "${BUILD_DIR}/pi/Dockerfile" << DOCKERFILE
+FROM ${IMAGE_BASE}:${IMAGE_TAG}
+
+RUN env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \\
+    npm install -g @mariozechner/pi-coding-agent@latest
+
+COPY domains.txt /etc/squid/domains.txt
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+DOCKERFILE
+
+    cat > "${BUILD_DIR}/pi/domains.txt" << 'DOMAINS'
+# Anthropic (if using Anthropic via Pi)
+.anthropic.com
+.claude.ai
+platform.claude.com
+# OpenAI
+api.openai.com
+# Google AI + OAuth
+generativelanguage.googleapis.com
+aiplatform.googleapis.com
+cloudcode-pa.googleapis.com
+oauth2.googleapis.com
+accounts.google.com
+www.googleapis.com
+# Mistral
+api.mistral.ai
+# OpenRouter
+openrouter.ai
+api.openrouter.ai
+# Git
+.github.com
+.githubusercontent.com
+# Python packages
+pypi.org
+files.pythonhosted.org
+# Astral (uv, ruff)
+astral.sh
+# npm
+registry.npmjs.org
+# Rust
+crates.io
+static.crates.io
+# apt
+ports.ubuntu.com
+archive.ubuntu.com
+security.ubuntu.com
+DOMAINS
+
+    cat > "${BUILD_DIR}/pi/entrypoint.sh" << 'ENTRYPOINT'
+#!/bin/bash
+# --- Network mode selection (validated; fail closed) ---
+case "${SANDBOX_NETWORK:-locked}" in
+    locked) SQUID_CONF=/etc/squid-locked.conf  ; NFT_CONF=/etc/nftables-locked.conf ;;
+    open)   SQUID_CONF=/etc/squid-open.conf    ; NFT_CONF=/etc/nftables-open.conf ;;
+    *)      echo "[entrypoint] FATAL: invalid SANDBOX_NETWORK='${SANDBOX_NETWORK}'" >&2
+            echo "[entrypoint] Must be 'locked' or 'open'. Refusing to start." >&2
+            exit 1 ;;
+esac
+
+# --- Squid proxy ---
+mkdir -p /run/squid /var/log/squid
+chown proxy:proxy /run/squid /var/log/squid
+squid -f "$SQUID_CONF" -z --foreground 2>/dev/null || true
+squid -f "$SQUID_CONF" -NYC &
+SQUID_PID=$!
+
+for _ in $(seq 1 30); do
+    if curl -sf -o /dev/null --proxy http://127.0.0.1:3128 http://ports.ubuntu.com 2>/dev/null; then
+        break
+    fi
+    sleep 0.2
+done
+
+# --- nftables ---
+nft -f "$NFT_CONF" 2>/dev/null || true
+
+# --- Pi config persistence ---
+if [ -d /home/agent/.pi ]; then
+    chown -R agent:agent /home/agent/.pi
+fi
+
+# --- Prompt (visual indicator for open mode; user can override) ---
+COLORS=(31 32 33 34 35 36 91 92 93 94 95 96)
+CLR=${COLORS[$((RANDOM % ${#COLORS[@]}))]}
+NETMODE_TAG=""
+if [ "${SANDBOX_NETWORK:-locked}" = "open" ]; then
+    NETMODE_TAG="\\[\\033[1;31m\\][OPEN]\\[\\033[0m\\] "
+fi
+echo "# SANDBOX_NETWORK=${SANDBOX_NETWORK:-locked} — override PS1 below to taste" \
+    >> /home/agent/.bashrc
+echo "PS1='${NETMODE_TAG}\\[\\033[1;${CLR}m\\]pi@\\h\\[\\033[0m\\]:\\[\\033[1;34m\\]\\w\\[\\033[0m\\]\\$ '" \
+    >> /home/agent/.bashrc
+echo "export SANDBOX_NETWORK=${SANDBOX_NETWORK:-locked}" >> /home/agent/.bashrc
+
+# --- Shutdown ---
+cleanup() { kill "$SQUID_PID" 2>/dev/null; wait "$SQUID_PID" 2>/dev/null; exit 0; }
+trap cleanup SIGTERM SIGINT
+
+# --- Exec ---
+CMD="${*:-/bin/bash}"
+exec sudo -u agent --preserve-env=HTTP_PROXY,HTTPS_PROXY,http_proxy,https_proxy,NO_PROXY,no_proxy \
+    env HOME=/home/agent \
+    bash -c "cd /workspace && $CMD"
+ENTRYPOINT
+
+    # ========================================================================
+    # GEMINI IMAGE
+    # ========================================================================
+
+    cat > "${BUILD_DIR}/gemini/Dockerfile" << DOCKERFILE
+FROM ${IMAGE_BASE}:${IMAGE_TAG}
+
+# gnome-keyring + dbus for OAuth token persistence (libsecret backend)
+RUN env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \\
+    DEBIAN_FRONTEND=noninteractive \\
+    apt-get -o Acquire::http::Proxy=false -o Acquire::https::Proxy=false update \\
+    && env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \\
+    DEBIAN_FRONTEND=noninteractive \\
+    apt-get -o Acquire::http::Proxy=false -o Acquire::https::Proxy=false \\
+    install -y --no-install-recommends dbus-x11 gnome-keyring libsecret-1-0 \\
+    && rm -rf /var/lib/apt/lists/*
+
+RUN env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \\
+    npm install -g @google/gemini-cli@latest
+
+COPY domains.txt /etc/squid/domains.txt
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+DOCKERFILE
+
+    cat > "${BUILD_DIR}/gemini/domains.txt" << 'DOMAINS'
+# Google AI + OAuth
+cloudcode-pa.googleapis.com
+generativelanguage.googleapis.com
+aiplatform.googleapis.com
+oauth2.googleapis.com
+accounts.google.com
+www.googleapis.com
+# Git
+.github.com
+.githubusercontent.com
+# Python packages
+pypi.org
+files.pythonhosted.org
+# Astral (uv, ruff)
+astral.sh
+# npm
+registry.npmjs.org
+# Rust
+crates.io
+static.crates.io
+# apt
+ports.ubuntu.com
+archive.ubuntu.com
+security.ubuntu.com
+DOMAINS
+
+    cat > "${BUILD_DIR}/gemini/entrypoint.sh" << 'ENTRYPOINT'
+#!/bin/bash
+# --- Network mode selection (validated; fail closed) ---
+case "${SANDBOX_NETWORK:-locked}" in
+    locked) SQUID_CONF=/etc/squid-locked.conf  ; NFT_CONF=/etc/nftables-locked.conf ;;
+    open)   SQUID_CONF=/etc/squid-open.conf    ; NFT_CONF=/etc/nftables-open.conf ;;
+    *)      echo "[entrypoint] FATAL: invalid SANDBOX_NETWORK='${SANDBOX_NETWORK}'" >&2
+            echo "[entrypoint] Must be 'locked' or 'open'. Refusing to start." >&2
+            exit 1 ;;
+esac
+
+# --- Squid proxy ---
+mkdir -p /run/squid /var/log/squid
+chown proxy:proxy /run/squid /var/log/squid
+squid -f "$SQUID_CONF" -z --foreground 2>/dev/null || true
+squid -f "$SQUID_CONF" -NYC &
+SQUID_PID=$!
+
+for _ in $(seq 1 30); do
+    if curl -sf -o /dev/null --proxy http://127.0.0.1:3128 http://ports.ubuntu.com 2>/dev/null; then
+        break
+    fi
+    sleep 0.2
+done
+
+# --- nftables ---
+nft -f "$NFT_CONF" 2>/dev/null || true
+
+# --- Gemini config persistence ---
+if [ -d /home/agent/.gemini ]; then
+    chown -R agent:agent /home/agent/.gemini
+fi
+
+# --- Keyring persistence (symlink into volume) ---
+mkdir -p /home/agent/.gemini/keyrings
+mkdir -p /home/agent/.local/share
+rm -rf /home/agent/.local/share/keyrings
+ln -sf /home/agent/.gemini/keyrings /home/agent/.local/share/keyrings
+chown -R agent:agent /home/agent/.local /home/agent/.gemini/keyrings
+
+# --- Prompt (visual indicator for open mode; user can override) ---
+COLORS=(31 32 33 34 35 36 91 92 93 94 95 96)
+CLR=${COLORS[$((RANDOM % ${#COLORS[@]}))]}
+NETMODE_TAG=""
+if [ "${SANDBOX_NETWORK:-locked}" = "open" ]; then
+    NETMODE_TAG="\\[\\033[1;31m\\][OPEN]\\[\\033[0m\\] "
+fi
+echo "# SANDBOX_NETWORK=${SANDBOX_NETWORK:-locked} — override PS1 below to taste" \
+    >> /home/agent/.bashrc
+echo "PS1='${NETMODE_TAG}\\[\\033[1;${CLR}m\\]gemini@\\h\\[\\033[0m\\]:\\[\\033[1;34m\\]\\w\\[\\033[0m\\]\\$ '" \
+    >> /home/agent/.bashrc
+echo "export SANDBOX_NETWORK=${SANDBOX_NETWORK:-locked}" >> /home/agent/.bashrc
+
+# --- Shutdown ---
+cleanup() { kill "$SQUID_PID" 2>/dev/null; wait "$SQUID_PID" 2>/dev/null; exit 0; }
+trap cleanup SIGTERM SIGINT
+
+# --- Exec (dbus-run-session for gnome-keyring / libsecret) ---
+CMD="${*:-/bin/bash}"
+exec sudo -u agent --preserve-env=HTTP_PROXY,HTTPS_PROXY,http_proxy,https_proxy,NO_PROXY,no_proxy \
+    env HOME=/home/agent \
+    dbus-run-session -- bash -c '
+        echo "" | gnome-keyring-daemon --unlock --components=secrets >/dev/null 2>&1
+        cd /workspace && '"$CMD"'
+    '
+ENTRYPOINT
+
+    ok "Build context written to ${BUILD_DIR}"
+}
+
+# ── Commands ────────────────────────────────────────────────────────────────
+
+cmd_setup() {
+    require_podman
+    write_build_context
+
+    # Build base image (from sandbox-lib.sh)
+    if ! build_base_image "$BUILD_DIR" "$IMAGE_BASE" "$IMAGE_TAG"; then
+        exit 1
+    fi
+
+    # Build per-agent images
+    for a in $KNOWN_AGENTS; do
+        local img
+        img="$(agent_get "$a" image)"
+        log "Building ${a} image..."
+        if ! podman build -t "$img" "${BUILD_DIR}/${a}"; then
+            err "${a} image build failed"
+            exit 1
+        fi
+        ok "Agent image: ${img}"
+    done
+
+    # Create per-agent auth volumes
+    for a in $KNOWN_AGENTS; do
+        local vol
+        vol="$(agent_get "$a" volume)"
+        volume_ensure "$vol"
+    done
+
+    # Create per-agent symlinks next to the script
+    local script_path
+    script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    for a in $KNOWN_AGENTS; do
+        local link="${SCRIPT_DIR}/${a}-sandbox"
+        if [ ! -e "$link" ]; then
+            ln -sf "$script_path" "$link"
+            ok "Symlink created: ${a}-sandbox → $(basename "$script_path")"
+        else
+            ok "Symlink exists: ${a}-sandbox"
+        fi
+    done
+
+    echo ""
+    ok "Setup complete. Usage:"
+    for a in $KNOWN_AGENTS; do
+        echo "  ${a}-sandbox run <project-path>   [--network locked|open]"
+        echo "  ${a}-sandbox shell <project-path> [--network locked|open]"
+    done
+    echo ""
+    echo "  $(basename "$0") status"
+    echo "  $(basename "$0") teardown <name|path>"
+    echo "  $(basename "$0") teardown all"
+}
+
+cmd_update() {
+    local target="${1:-}"
+    require_podman
+
+    if [ -z "$target" ]; then
+        err "Usage: $(basename "$0") update <agent|all>"
+        echo "  Agents: $KNOWN_AGENTS"
+        exit 1
+    fi
+
+    local agents_to_update
+    if [ "$target" = "all" ]; then
+        agents_to_update="$KNOWN_AGENTS"
+    else
+        validate_agent "$target"
+        agents_to_update="$target"
+    fi
+
+    if ! image_exists "${IMAGE_BASE}:${IMAGE_TAG}"; then
+        err "Base image not found. Run: $(basename "$0") setup"
+        exit 1
+    fi
+
+    write_build_context
+
+    for a in $agents_to_update; do
+        local img
+        img="$(agent_get "$a" image)"
+        log "Rebuilding ${a} image (--no-cache)..."
+        if ! podman build --no-cache -t "$img" "${BUILD_DIR}/${a}"; then
+            err "${a} image rebuild failed"
+            exit 1
+        fi
+        ok "Updated: ${img}"
+
+        local running
+        running=$(podman ps --filter "ancestor=${img}" --filter "status=running" --format '{{.Names}}' 2>/dev/null)
+        if [ -n "$running" ]; then
+            warn "Running containers still use the old image — restart to pick up the update:"
+            echo "$running" | while read -r ctr; do
+                echo "  $ctr"
+            done
+        fi
+    done
+}
+
+cmd_teardown() {
+    local target="${1:-}"
+    require_podman
+
+    if [ -z "$target" ]; then
+        err "Specify a project path or 'all'"
+        echo "Usage: $(basename "$0") teardown <project-path>   # remove containers for project"
+        echo "       $(basename "$0") teardown all              # remove everything"
+        echo ""
+        echo "Containers:"
+        list_containers_by_prefix "$CONTAINER_PREFIX" | while IFS=$'\t' read -r name state created; do
+            echo "  $name ($state)"
+        done
+        exit 1
+    fi
+
+    if [ "$target" = "all" ]; then
+        log "Tearing down all sandbox resources..."
+
+        local containers
+        containers=$(podman ps -a --filter "name=^${CONTAINER_PREFIX}-" --format '{{.Names}}' 2>/dev/null)
+        if [ -n "$containers" ]; then
+            echo "$containers" | xargs podman rm -f 2>/dev/null
+            ok "Containers removed: $(echo "$containers" | tr '\n' ' ')"
+        fi
+
+        # Legacy containers
+        local legacy
+        legacy=$(podman ps -a --filter "name=^claude-sandbox-" --format '{{.Names}}' 2>/dev/null)
+        if [ -n "$legacy" ]; then
+            echo "$legacy" | xargs podman rm -f 2>/dev/null
+            ok "Legacy containers removed: $(echo "$legacy" | tr '\n' ' ')"
+        fi
+
+        # Agent images
+        for a in $KNOWN_AGENTS; do
+            local img
+            img="$(agent_get "$a" image)"
+            if image_exists "$img"; then
+                podman rmi "$img" 2>/dev/null
+                ok "Image removed: ${img}"
+            fi
+        done
+
+        # Base image
+        if image_exists "${IMAGE_BASE}:${IMAGE_TAG}"; then
+            podman rmi "${IMAGE_BASE}:${IMAGE_TAG}" 2>/dev/null
+            ok "Base image removed"
+        fi
+
+        # Legacy image
+        if image_exists "claude-sandbox:latest"; then
+            podman rmi "claude-sandbox:latest" 2>/dev/null
+            ok "Legacy image removed"
+        fi
+
+        # Per-agent auth volumes
+        for a in $KNOWN_AGENTS; do
+            local vol
+            vol="$(agent_get "$a" volume)"
+            if volume_exists "$vol"; then
+                echo -n "Remove ${a} auth volume '${vol}' (you'll need to re-authenticate)? [y/N] "
+                read -r answer
+                if [[ "$answer" =~ ^[Yy]$ ]]; then
+                    volume_remove "$vol"
+                else
+                    warn "Auth volume kept: ${vol}"
+                fi
+            fi
+        done
+
+        if [ -d "$BUILD_DIR" ]; then
+            rm -rf "$BUILD_DIR"
+            ok "Build context removed"
+        fi
+
+        # Remove agent symlinks
+        for a in $KNOWN_AGENTS; do
+            local link="${SCRIPT_DIR}/${a}-sandbox"
+            if [ -L "$link" ]; then
+                rm "$link"
+                ok "Symlink removed: ${a}-sandbox"
+            fi
+        done
+
+        ok "Full teardown complete"
+    else
+        local project_name
+        if [ -d "$target" ]; then
+            project_name="$(basename "$(cd "$target" && pwd)")"
+        else
+            project_name="$(basename "$target")"
+        fi
+
+        local found=0
+        for a in $KNOWN_AGENTS; do
+            local ctr_name
+            ctr_name="$(container_name_for "$CONTAINER_PREFIX" "$a" "$project_name")"
+            if container_exists "$ctr_name"; then
+                podman rm -f "$ctr_name" 2>/dev/null
+                ok "Container removed: ${ctr_name}"
+                found=1
+            fi
+        done
+
+        # Legacy naming
+        local legacy_name
+        legacy_name="claude-sandbox-$(sanitize_name "$project_name")"
+        if container_exists "$legacy_name"; then
+            podman rm -f "$legacy_name" 2>/dev/null
+            ok "Container removed (legacy): ${legacy_name}"
+            found=1
+        fi
+
+        if [ "$found" -eq 0 ]; then
+            warn "No containers found for project: ${project_name}"
+        fi
+    fi
+}
+
+cmd_status() {
+    require_podman
+
+    echo "=== Agent Sandbox ==="
+    echo ""
+
+    if image_exists "${IMAGE_BASE}:${IMAGE_TAG}"; then
+        ok "Base image: ${IMAGE_BASE}:${IMAGE_TAG}"
+    else
+        warn "Base image: not built"
+    fi
+
+    for a in $KNOWN_AGENTS; do
+        local img vol
+        img="$(agent_get "$a" image)"
+        vol="$(agent_get "$a" volume)"
+
+        if image_exists "$img"; then
+            local img_info
+            img_info=$(podman image inspect "$img" --format '{{.Created}}  {{.Size}}' 2>/dev/null)
+            ok "Image [${a}]: ${img}  (${img_info})"
+        else
+            warn "Image [${a}]: not built"
+        fi
+
+        if volume_exists "$vol"; then
+            ok "Volume [${a}]: ${vol}"
+        else
+            warn "Volume [${a}]: not created"
+        fi
+    done
+
+    local containers
+    containers=$(list_containers_by_prefix "$CONTAINER_PREFIX")
+    if [ -n "$containers" ]; then
+        echo "   Containers:"
+        echo "$containers" | while IFS=$'\t' read -r name state created; do
+            if [ "$state" = "running" ]; then
+                ok "  $name ($state, $created)"
+            else
+                warn "  $name ($state, $created)"
+            fi
+        done
+    else
+        echo "   Containers: none"
+    fi
+
+    echo ""
+    podman machine info 2>/dev/null | head -5 || warn "Podman machine not reachable"
+}
+
+run_container() {
+    local agent="$1" ctr_name="$2" project_path="$3" project_name="$4" cmd="$5"
+
+    # Refuse on existing container — do not silently destroy in-flight work.
+    # User makes the choice: resume via `podman exec`, or `agent-sandbox teardown`.
+    if container_exists "$ctr_name"; then
+        local existing_status existing_image existing_network
+        existing_status=$(podman ps -a --filter "name=^${ctr_name}\$" --format '{{.Status}}' 2>/dev/null | head -1)
+        existing_image=$(podman inspect "$ctr_name" --format '{{.ImageName}}' 2>/dev/null)
+        existing_network=$(podman inspect "$ctr_name" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+                           | grep '^SANDBOX_NETWORK=' | cut -d= -f2)
+        err "A sandbox already exists for this project."
+        {
+            echo "         container: $ctr_name"
+            echo "         status:    ${existing_status:-unknown}"
+            echo "         image:     ${existing_image:-unknown}"
+            echo "         network:   ${existing_network:-locked}"
+            echo ""
+            echo "       To resume working in it (open a second shell into the running container):"
+            echo "         podman exec -it $ctr_name bash"
+            echo ""
+            echo "       To remove it and start fresh:"
+            echo "         $(basename "$0") teardown $project_name"
+            echo ""
+            echo "       Exiting without changes."
+        } >&2
+        exit 1
+    fi
+
+    local agent_image agent_volume agent_config_dir agent_cmd agent_ports
+    agent_image="$(agent_get "$agent" image)"
+    agent_volume="$(agent_get "$agent" volume)"
+    agent_config_dir="$(agent_get "$agent" config_dir)"
+    agent_cmd="$(agent_get "$agent" command)"
+    agent_ports="$(agent_get "$agent" ports)"
+
+    local exec_cmd="$cmd"
+    if [ "$cmd" = "__agent__" ]; then
+        exec_cmd="$agent_cmd"
+    fi
+
+    # Random host port — lets multiple pi/gemini sandboxes coexist.
+    # Discover the assigned port with: podman port <container>
+    local port_args=()
+    if [ -n "$agent_ports" ]; then
+        for p in $agent_ports; do
+            port_args+=(-p "${p}")
+        done
+    fi
+
+    # In open mode, disable IPv6 in the container via kernel-namespaced sysctls.
+    # Defense in depth: even though squid-open and nftables-open both block
+    # IPv6 destinations, killing the stack outright is simpler than maintaining
+    # parallel ip6 ACL sets that handle SLAAC, ULA, link-local correctly.
+    local sysctl_args=()
+    if [ "${NETWORK:-locked}" = "open" ]; then
+        sysctl_args+=(--sysctl "net.ipv6.conf.all.disable_ipv6=1")
+        sysctl_args+=(--sysctl "net.ipv6.conf.default.disable_ipv6=1")
+    fi
+
+    # shellcheck disable=SC2086  # word-splitting on $exec_cmd is intentional: it may be a multi-token command
+    podman run --rm -it \
+        --name "$ctr_name" \
+        --hostname "sandbox-${agent}-${project_name}" \
+        --cap-add=NET_ADMIN \
+        "${port_args[@]+"${port_args[@]}"}" \
+        "${sysctl_args[@]+"${sysctl_args[@]}"}" \
+        -v "${project_path}:/workspace:rw" \
+        -v "${agent_volume}:${agent_config_dir}:rw" \
+        -e "CLAUDE_PROJECT=${project_name}" \
+        -e "SANDBOX_NETWORK=${NETWORK:-locked}" \
+        "$agent_image" \
+        $exec_cmd
+}
+
+cmd_run() {
+    local agent="$1" project_path="$2"
+    require_podman
+
+    local img
+    img="$(agent_get "$agent" image)"
+    if ! image_exists "$img"; then
+        err "Image not built for ${agent}. Run: $(basename "$0") setup"
+        exit 1
+    fi
+
+    project_path="$(resolve_project_path "$project_path")"
+    local project_name
+    project_name="$(basename "$project_path")"
+    local ctr_name
+    ctr_name="$(container_name_for "$CONTAINER_PREFIX" "$agent" "$project_name")"
+
+    log "Starting ${agent} (${NETWORK:-locked}): ${project_name} [${ctr_name}]"
+    run_container "$agent" "$ctr_name" "$project_path" "$project_name" "__agent__"
+}
+
+cmd_shell() {
+    local agent="$1" project_path="$2"
+    require_podman
+
+    local img
+    img="$(agent_get "$agent" image)"
+    if ! image_exists "$img"; then
+        err "Image not built for ${agent}. Run: $(basename "$0") setup"
+        exit 1
+    fi
+
+    project_path="$(resolve_project_path "$project_path")"
+    local project_name
+    project_name="$(basename "$project_path")"
+    local ctr_name
+    ctr_name="$(container_name_for "$CONTAINER_PREFIX" "$agent" "$project_name")"
+
+    log "Opening shell (${agent}, ${NETWORK:-locked}): ${project_name} [${ctr_name}]"
+    run_container "$agent" "$ctr_name" "$project_path" "$project_name" "/bin/bash"
+}
+
+# ── Main ────────────────────────────────────────────────────────────────────
+
+usage() {
+    cat << EOF
+Usage: <agent>-sandbox <command> [options]
+
+Symlinks (created by setup):
+$(for a in $KNOWN_AGENTS; do
+    echo "  ${a}-sandbox run   <project-path> [--network locked|open]"
+    echo "  ${a}-sandbox shell <project-path> [--network locked|open]"
+done)
+
+Network modes:
+  locked  (default)  Default-deny allowlist; only per-agent domains reachable
+  open               Public internet allowed; private networks denied at squid
+                     AND nftables; IPv6 disabled in container
+
+Management:
+  $(basename "$0") setup                       Build all images and create volumes + symlinks
+  $(basename "$0") update <agent|all>          Rebuild agent image(s) with latest package
+  $(basename "$0") status                      Show sandbox component status
+  $(basename "$0") teardown <name|path>        Remove containers for a project
+  $(basename "$0") teardown all                Remove everything
+
+Or use --agent directly:
+  $(basename "$0") run   <project-path> --agent NAME [--network MODE]
+  $(basename "$0") shell <project-path> --agent NAME [--network MODE]
+EOF
+}
+
+case "${1:-}" in
+    setup)
+        cmd_setup
+        ;;
+    update)
+        cmd_update "${2:-}"
+        ;;
+    teardown)
+        cmd_teardown "${2:-}"
+        ;;
+    status)
+        cmd_status
+        ;;
+    run)
+        shift
+        parse_agent_flag "$@"
+        if [ ${#REMAINING_ARGS[@]} -eq 0 ]; then
+            err "Missing project path"
+            echo "Usage: $(basename "$0") run <project-path>"
+            exit 1
+        fi
+        cmd_run "$AGENT" "${REMAINING_ARGS[0]}"
+        ;;
+    shell)
+        shift
+        parse_agent_flag "$@"
+        if [ ${#REMAINING_ARGS[@]} -eq 0 ]; then
+            err "Missing project path"
+            echo "Usage: $(basename "$0") shell <project-path>"
+            exit 1
+        fi
+        cmd_shell "$AGENT" "${REMAINING_ARGS[0]}"
+        ;;
+    *)
+        usage
+        exit 1
+        ;;
+esac

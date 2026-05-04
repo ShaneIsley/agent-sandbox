@@ -1,6 +1,6 @@
 # agent-sandbox
 
-```bash
+```
     ___________________
    /                  /|
   /   >_ AGENT       / |
@@ -8,7 +8,7 @@
 /__________________/   |
 |      _______     |   |
 |     |       |    |   |
-|     |  [🔐] |    |   /
+|     |  [#]  |    |   /
 |     |_______|    | /
 |__________________|/
 ```
@@ -290,6 +290,25 @@ To add a domain (locked mode only — open mode reaches it already):
 
 A few design decisions that aren't obvious from the code.
 
+### Why Podman, not Docker, OrbStack, or Apple's native frameworks
+
+Podman was chosen deliberately after evaluating each alternative against the security requirements. The summary:
+
+**vs. Docker Desktop / OrbStack containers** — equivalent container-level isolation (only explicit `-v` mounts visible), but both run as a privileged background daemon. Podman is daemonless and rootless by default — the runtime itself doesn't need root to start a container. For a tool whose entire purpose is containing potentially-untrusted code, "the runtime doesn't need root" is a coherent design alignment. Podman is also Apache-2.0 (auditable end-to-end) and unconditionally free for any use; OrbStack is proprietary and freemium, Docker Desktop has paid tiers for organizations. Trade-off accepted: Podman uses ~1GB more idle RAM and is ~20s slower on cold start than OrbStack.
+
+**vs. OrbStack Linux VMs** — explicitly unsafe for sandboxing. OrbStack VMs expose the entire macOS filesystem (`/Users`, `/Applications`, `/Library`, `/Volumes`, `/private`) via virtiofs with no setting to disable it. Multiple unanswered GitHub issues (#169, #1269, #1243, #2308) request this; OrbStack's own docs say *"Linux machines are considered trusted because OrbStack provides integration with macOS"* — by design. **Never use OrbStack VMs for sandboxing.** OrbStack containers are fine; only the VM feature has this issue.
+
+**vs. macOS `sandbox-exec` (Seatbelt)** — used by tools like Claude Code's built-in `/sandbox`, SandVault, Agent Safehouse, and `alcless`. Provides path-based filesystem allow/deny but no real isolation primitives: same filesystem view, no PID/mount/network namespaces, no syscall filtering equivalent to seccomp. The profile language is an undocumented Scheme dialect that Apple has formally deprecated (still works, still powers App Sandbox internally, but Apple doesn't document it and could remove it). macOS sandboxing is fundamentally weaker than Linux namespace isolation — this is why every serious macOS agent sandbox eventually lands on running a Linux VM.
+
+**vs. Apple's `apple/container` (Containerization framework)** — the most interesting alternative, worth tracking but not adopting yet. Apple's macOS 26 container runtime gives each container its own lightweight Linux micro-VM on Virtualization.framework, providing hardware-level isolation stronger than Podman's shared-kernel namespace isolation. Sub-second startup despite per-VM overhead. It's an attractive future option — but as of this writing:
+
+- Pre-1.0 with known stability issues (data-integrity bug as recently as 0.7.1)
+- Networking features are "severely limited"; no `--network=none` equivalent and no equivalent to this project's `meta skuid proxy` nftables enforcement
+- Per-VM memory overhead is meaningfully higher than Podman's namespace-based containers sharing one kernel
+- No GPU passthrough (irrelevant here, but indicates the framework is incomplete)
+
+The Squid + nftables + non-root-agent stack used here achieves the same network-policy guarantees more reliably on a battle-tested runtime. Worth revisiting when apple/container reaches 1.0 and ships full network isolation — at that point it could replace the entire Podman layer.
+
 ### Why squid runs inside each container instead of on the host or in a sidecar
 
 Each container has its own squid + its own nftables ruleset, in its own network namespace. Running squid on the host or in a shared sidecar would mean:
@@ -362,7 +381,7 @@ Working as designed. Open mode blocks RFC1918, link-local, loopback, and CGNAT. 
 
 ### Linux host: "Podman machine not running"
 
-The current `require_podman` check assumes macOS (where Podman uses a Linux VM). On Linux, Podman runs natively without a machine. Workaround: comment out or modify the `podman machine info` check in `sandbox-lib.sh`. See IMPROVEMENTS.md item 3.4 for the planned fix.
+The current `require_podman` check assumes macOS (where Podman uses a Linux VM). On Linux, Podman runs natively without a machine. Workaround: comment out or modify the `podman machine info` check in `sandbox-lib.sh`. See IMPROVEMENTS.md item 3.4 (Linux native podman support) for the planned fix.
 
 ### `Squid Parent: will start 1 kids` messages on every container start
 
@@ -415,7 +434,7 @@ The sandbox is designed for defense in depth against a *misbehaving* agent (trai
 
 Non-obvious things that influenced the design.
 
-1. **OrbStack VMs expose the entire Mac filesystem via virtiofs.** `/Users`, `/Applications`, `/Library`, `/Volumes`, `/private` are all visible inside any OrbStack Linux VM, with no setting to disable it. This sandbox uses Podman specifically to avoid that. (OrbStack *containers* are fine — only the VM feature has this issue.)
+1. **OrbStack VMs expose the entire Mac filesystem via virtiofs.** `/Users`, `/Applications`, `/Library`, `/Volumes`, `/private` are all visible inside any OrbStack Linux VM, with no setting to disable it. This is one of several reasons we use Podman; see "Why Podman, not Docker, OrbStack, or Apple's native frameworks" above for the full runtime-choice rationale. (OrbStack *containers* are fine — only the VM feature has this issue.)
 2. **iptables `owner` match for port 80 fails silently in some VM kernels.** This setup uses `nft` directly with `meta skuid proxy` instead.
 3. **`set -e` plus `((var++))` is a footgun.** When `var=0`, `((var++))` returns exit code 1 and kills your script. Validation scripts use `set -uo pipefail` (no `-e`) and `var=$((var+1))` to avoid this. The main scripts also use `set -uo pipefail` for the same reason; see IMPROVEMENTS.md item 2.6 for the trade-offs.
 4. **squid syslog can't be silenced from the parent shell.** "Squid Parent: will start 1 kids" goes to `/dev/console` via syslog, not stderr. Live with it.

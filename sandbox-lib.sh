@@ -298,93 +298,130 @@ build_base_image() {
     ok "Base image: ${image_name}:${image_tag}"
 }
 
-# ── Entrypoint template (UNUSED — kept for compat) ──────────────────────────
-# Currently dead code: agent-sandbox writes its own three entrypoint heredocs
-# inline rather than calling this helper. Kept for now to avoid breaking any
-# downstream consumers; consolidation is planned but not yet scheduled.
+# ── Entrypoint template ─────────────────────────────────────────────────────
+# Writes a complete entrypoint.sh to <output_path>. Used by agent-sandbox to
+# generate per-agent entrypoints; collapses three near-identical 60-line
+# heredocs into one helper.
+#
+# Arguments:
+#   output_path           where to write the file
+#   agent_name            'claude' | 'pi' | 'gemini' (used for prompt)
+#   agent_setup_block     bash code for agent-specific persistence/auth
+#                         (multi-line string, may be empty)
+#   exec_form             'standard' (default) | 'dbus'
+#                         dbus wraps the final exec in dbus-run-session +
+#                         gnome-keyring-daemon — needed for libsecret.
+#
+# Design notes:
+#   - All heredocs are QUOTED. No write-time variable expansion. This keeps
+#     escape rules normal (one backslash means one backslash) instead of the
+#     double-escape gymnastics required by unquoted heredocs.
+#   - Agent name is passed through to the entrypoint as an AGENT_NAME shell
+#     variable rather than being substituted at write time. The PS1 line
+#     references "${AGENT_NAME}" and bash expands it at runtime.
+#   - exec_form is an enum, not an arbitrary bash string. The two known forms
+#     are documented and predictable; arbitrary strings invite breakage.
 
 write_entrypoint() {
     local output_path="$1"
     local agent_name="$2"
-    local agent_setup_block="${3:-}"   # Extra bash commands for agent-specific config
-    local exec_wrapper="${4:-}"        # Wrap the final exec (e.g., dbus-run-session)
+    local agent_setup_block="${3:-}"
+    local exec_form="${4:-standard}"
 
-    cat > "$output_path" << ENTRYPOINT_HEADER
-#!/bin/bash
+    case "$exec_form" in
+        standard|dbus) ;;
+        *) err "write_entrypoint: unknown exec_form '$exec_form' (want 'standard' or 'dbus')"
+           return 1 ;;
+    esac
+
+    # ── Common head: AGENT_NAME, network mode, squid, readiness loop, nftables.
+    # Quoted heredoc: everything literal. AGENT_NAME is set via direct write
+    # before the heredoc so it's a real shell variable in the output script.
+    {
+        printf '#!/bin/bash\n'
+        printf 'AGENT_NAME=%q\n\n' "$agent_name"
+    } > "$output_path"
+
+    cat >> "$output_path" << 'ENTRYPOINT_HEAD'
 # --- Network mode selection (validated; fail closed) ---
-case "\${SANDBOX_NETWORK:-locked}" in
+case "${SANDBOX_NETWORK:-locked}" in
     locked) SQUID_CONF=/etc/squid-locked.conf  ; NFT_CONF=/etc/nftables-locked.conf ;;
     open)   SQUID_CONF=/etc/squid-open.conf    ; NFT_CONF=/etc/nftables-open.conf ;;
-    *)      echo "[entrypoint] FATAL: invalid SANDBOX_NETWORK='\${SANDBOX_NETWORK}'" >&2
+    *)      echo "[entrypoint] FATAL: invalid SANDBOX_NETWORK='${SANDBOX_NETWORK}'" >&2
+            echo "[entrypoint] Must be 'locked' or 'open'. Refusing to start." >&2
             exit 1 ;;
 esac
 
 # --- Squid proxy ---
 mkdir -p /run/squid /var/log/squid
 chown proxy:proxy /run/squid /var/log/squid
-squid -f "\$SQUID_CONF" -z --foreground 2>/dev/null || true
-squid -f "\$SQUID_CONF" -NYC &
-SQUID_PID=\$!
+squid -f "$SQUID_CONF" -z --foreground 2>/dev/null || true
+squid -f "$SQUID_CONF" -NYC &
+SQUID_PID=$!
 
-for _ in \$(seq 1 30); do
+SQUID_READY=0
+for _ in $(seq 1 30); do
     if curl -sf -o /dev/null --proxy http://127.0.0.1:3128 http://ports.ubuntu.com 2>/dev/null; then
+        SQUID_READY=1
         break
     fi
     sleep 0.2
 done
+[ "$SQUID_READY" -eq 0 ] && echo "[entrypoint] WARNING: squid did not become reachable in 6s — network access may be broken" >&2
 
 # --- nftables ---
-nft -f "\$NFT_CONF" 2>/dev/null || true
+nft -f "$NFT_CONF" 2>/dev/null || true
 
-ENTRYPOINT_HEADER
+ENTRYPOINT_HEAD
 
-    # Agent-specific setup block
+    # ── Agent-specific persistence block (caller-supplied; may be empty)
     if [ -n "$agent_setup_block" ]; then
-        echo "$agent_setup_block" >> "$output_path"
-        echo "" >> "$output_path"
+        printf '%s\n\n' "$agent_setup_block" >> "$output_path"
     fi
 
-    # Prompt with random colour and optional [OPEN] tag
-    cat >> "$output_path" << ENTRYPOINT_PROMPT
+    # ── Common prompt block. Uses AGENT_NAME (set above) at runtime.
+    cat >> "$output_path" << 'ENTRYPOINT_PROMPT'
 # --- Prompt (visual indicator for open mode; user can override) ---
 COLORS=(31 32 33 34 35 36 91 92 93 94 95 96)
-CLR=\${COLORS[\$((RANDOM % \${#COLORS[@]}))]}
+CLR=${COLORS[$((RANDOM % ${#COLORS[@]}))]}
 NETMODE_TAG=""
-if [ "\${SANDBOX_NETWORK:-locked}" = "open" ]; then
-    NETMODE_TAG="\\\\[\\\\033[1;31m\\\\][OPEN]\\\\[\\\\033[0m\\\\] "
+if [ "${SANDBOX_NETWORK:-locked}" = "open" ]; then
+    NETMODE_TAG="\\[\\033[1;31m\\][OPEN]\\[\\033[0m\\] "
 fi
-echo "# SANDBOX_NETWORK=\${SANDBOX_NETWORK:-locked} — override PS1 below to taste" \\
+echo "# SANDBOX_NETWORK=${SANDBOX_NETWORK:-locked} — override PS1 below to taste" \
     >> /home/agent/.bashrc
-echo "PS1='\${NETMODE_TAG}\\\\[\\\\033[1;\${CLR}m\\\\]${agent_name}@\\\\h\\\\[\\\\033[0m\\\\]:\\\\[\\\\033[1;34m\\\\]\\\\w\\\\[\\\\033[0m\\\\]\\\$ '" \\
+echo "PS1='${NETMODE_TAG}\\[\\033[1;${CLR}m\\]${AGENT_NAME}@\\h\\[\\033[0m\\]:\\[\\033[1;34m\\]\\w\\[\\033[0m\\]\\$ '" \
     >> /home/agent/.bashrc
-echo "export SANDBOX_NETWORK=\${SANDBOX_NETWORK:-locked}" >> /home/agent/.bashrc
+echo "export SANDBOX_NETWORK=${SANDBOX_NETWORK:-locked}" >> /home/agent/.bashrc
 
-ENTRYPOINT_PROMPT
-
-    # Shutdown handler
-    cat >> "$output_path" << 'ENTRYPOINT_SHUTDOWN'
 # --- Shutdown ---
 cleanup() { kill "$SQUID_PID" 2>/dev/null; wait "$SQUID_PID" 2>/dev/null; exit 0; }
 trap cleanup SIGTERM SIGINT
 
-ENTRYPOINT_SHUTDOWN
+ENTRYPOINT_PROMPT
 
-    # Exec block
-    if [ -n "$exec_wrapper" ]; then
-        cat >> "$output_path" << ENTRYPOINT_EXEC_WRAP
-# --- Exec (wrapped) ---
-CMD="\${*:-/bin/bash}"
-exec sudo -u agent --preserve-env=HTTP_PROXY,HTTPS_PROXY,http_proxy,https_proxy,NO_PROXY,no_proxy \\
-    env HOME=/home/agent \\
-    ${exec_wrapper}
-ENTRYPOINT_EXEC_WRAP
-    else
-        cat >> "$output_path" << 'ENTRYPOINT_EXEC'
+    # ── Exec block. Two forms.
+    case "$exec_form" in
+        standard)
+            cat >> "$output_path" << 'ENTRYPOINT_EXEC_STD'
 # --- Exec ---
 CMD="${*:-/bin/bash}"
 exec sudo -u agent --preserve-env=HTTP_PROXY,HTTPS_PROXY,http_proxy,https_proxy,NO_PROXY,no_proxy \
     env HOME=/home/agent \
     bash -c "cd /workspace && $CMD"
-ENTRYPOINT_EXEC
-    fi
+ENTRYPOINT_EXEC_STD
+            ;;
+        dbus)
+            cat >> "$output_path" << 'ENTRYPOINT_EXEC_DBUS'
+# --- Exec (dbus-run-session for gnome-keyring / libsecret) ---
+CMD="${*:-/bin/bash}"
+exec sudo -u agent --preserve-env=HTTP_PROXY,HTTPS_PROXY,http_proxy,https_proxy,NO_PROXY,no_proxy \
+    env HOME=/home/agent \
+    dbus-run-session -- bash -c '
+        echo "" | gnome-keyring-daemon --unlock --components=secrets >/dev/null 2>&1
+        cd /workspace && '"$CMD"'
+    '
+ENTRYPOINT_EXEC_DBUS
+            ;;
+    esac
 }

@@ -209,37 +209,7 @@ archive.ubuntu.com
 security.ubuntu.com
 DOMAINS
 
-    cat > "${BUILD_DIR}/claude/entrypoint.sh" << 'ENTRYPOINT'
-#!/bin/bash
-# --- Network mode selection (validated; fail closed) ---
-case "${SANDBOX_NETWORK:-locked}" in
-    locked) SQUID_CONF=/etc/squid-locked.conf  ; NFT_CONF=/etc/nftables-locked.conf ;;
-    open)   SQUID_CONF=/etc/squid-open.conf    ; NFT_CONF=/etc/nftables-open.conf ;;
-    *)      echo "[entrypoint] FATAL: invalid SANDBOX_NETWORK='${SANDBOX_NETWORK}'" >&2
-            echo "[entrypoint] Must be 'locked' or 'open'. Refusing to start." >&2
-            exit 1 ;;
-esac
-
-# --- Squid proxy ---
-mkdir -p /run/squid /var/log/squid
-chown proxy:proxy /run/squid /var/log/squid
-squid -f "$SQUID_CONF" -z --foreground 2>/dev/null || true
-squid -f "$SQUID_CONF" -NYC &
-SQUID_PID=$!
-
-SQUID_READY=0
-for _ in $(seq 1 30); do
-    if curl -sf -o /dev/null --proxy http://127.0.0.1:3128 http://ports.ubuntu.com 2>/dev/null; then
-        SQUID_READY=1
-        break
-    fi
-    sleep 0.2
-done
-[ "$SQUID_READY" -eq 0 ] && echo "[entrypoint] WARNING: squid did not become reachable in 6s — network access may be broken" >&2
-
-# --- nftables ---
-nft -f "$NFT_CONF" 2>/dev/null || true
-
+    write_entrypoint "${BUILD_DIR}/claude/entrypoint.sh" claude "$(cat << 'CLAUDE_SETUP'
 # --- Claude auth persistence ---
 if [ -d /home/agent/.claude ]; then
     chown -R agent:agent /home/agent/.claude
@@ -252,30 +222,8 @@ fi
 
 # Force subscription auth
 unset ANTHROPIC_API_KEY
-
-# --- Prompt (visual indicator for open mode; user can override) ---
-COLORS=(31 32 33 34 35 36 91 92 93 94 95 96)
-CLR=${COLORS[$((RANDOM % ${#COLORS[@]}))]}
-NETMODE_TAG=""
-if [ "${SANDBOX_NETWORK:-locked}" = "open" ]; then
-    NETMODE_TAG="\\[\\033[1;31m\\][OPEN]\\[\\033[0m\\] "
-fi
-echo "# SANDBOX_NETWORK=${SANDBOX_NETWORK:-locked} — override PS1 below to taste" \
-    >> /home/agent/.bashrc
-echo "PS1='${NETMODE_TAG}\\[\\033[1;${CLR}m\\]claude@\\h\\[\\033[0m\\]:\\[\\033[1;34m\\]\\w\\[\\033[0m\\]\\$ '" \
-    >> /home/agent/.bashrc
-echo "export SANDBOX_NETWORK=${SANDBOX_NETWORK:-locked}" >> /home/agent/.bashrc
-
-# --- Shutdown ---
-cleanup() { kill "$SQUID_PID" 2>/dev/null; wait "$SQUID_PID" 2>/dev/null; exit 0; }
-trap cleanup SIGTERM SIGINT
-
-# --- Exec ---
-CMD="${*:-/bin/bash}"
-exec sudo -u agent --preserve-env=HTTP_PROXY,HTTPS_PROXY,http_proxy,https_proxy,NO_PROXY,no_proxy \
-    env HOME=/home/agent \
-    bash -c "cd /workspace && $CMD"
-ENTRYPOINT
+CLAUDE_SETUP
+)" standard
 
     # ========================================================================
     # PI IMAGE
@@ -332,65 +280,13 @@ archive.ubuntu.com
 security.ubuntu.com
 DOMAINS
 
-    cat > "${BUILD_DIR}/pi/entrypoint.sh" << 'ENTRYPOINT'
-#!/bin/bash
-# --- Network mode selection (validated; fail closed) ---
-case "${SANDBOX_NETWORK:-locked}" in
-    locked) SQUID_CONF=/etc/squid-locked.conf  ; NFT_CONF=/etc/nftables-locked.conf ;;
-    open)   SQUID_CONF=/etc/squid-open.conf    ; NFT_CONF=/etc/nftables-open.conf ;;
-    *)      echo "[entrypoint] FATAL: invalid SANDBOX_NETWORK='${SANDBOX_NETWORK}'" >&2
-            echo "[entrypoint] Must be 'locked' or 'open'. Refusing to start." >&2
-            exit 1 ;;
-esac
-
-# --- Squid proxy ---
-mkdir -p /run/squid /var/log/squid
-chown proxy:proxy /run/squid /var/log/squid
-squid -f "$SQUID_CONF" -z --foreground 2>/dev/null || true
-squid -f "$SQUID_CONF" -NYC &
-SQUID_PID=$!
-
-SQUID_READY=0
-for _ in $(seq 1 30); do
-    if curl -sf -o /dev/null --proxy http://127.0.0.1:3128 http://ports.ubuntu.com 2>/dev/null; then
-        SQUID_READY=1
-        break
-    fi
-    sleep 0.2
-done
-[ "$SQUID_READY" -eq 0 ] && echo "[entrypoint] WARNING: squid did not become reachable in 6s — network access may be broken" >&2
-
-# --- nftables ---
-nft -f "$NFT_CONF" 2>/dev/null || true
-
+    write_entrypoint "${BUILD_DIR}/pi/entrypoint.sh" pi "$(cat << 'PI_SETUP'
 # --- Pi config persistence ---
 if [ -d /home/agent/.pi ]; then
     chown -R agent:agent /home/agent/.pi
 fi
-
-# --- Prompt (visual indicator for open mode; user can override) ---
-COLORS=(31 32 33 34 35 36 91 92 93 94 95 96)
-CLR=${COLORS[$((RANDOM % ${#COLORS[@]}))]}
-NETMODE_TAG=""
-if [ "${SANDBOX_NETWORK:-locked}" = "open" ]; then
-    NETMODE_TAG="\\[\\033[1;31m\\][OPEN]\\[\\033[0m\\] "
-fi
-echo "# SANDBOX_NETWORK=${SANDBOX_NETWORK:-locked} — override PS1 below to taste" \
-    >> /home/agent/.bashrc
-echo "PS1='${NETMODE_TAG}\\[\\033[1;${CLR}m\\]pi@\\h\\[\\033[0m\\]:\\[\\033[1;34m\\]\\w\\[\\033[0m\\]\\$ '" \
-    >> /home/agent/.bashrc
-echo "export SANDBOX_NETWORK=${SANDBOX_NETWORK:-locked}" >> /home/agent/.bashrc
-
-# --- Shutdown ---
-cleanup() { kill "$SQUID_PID" 2>/dev/null; wait "$SQUID_PID" 2>/dev/null; exit 0; }
-trap cleanup SIGTERM SIGINT
-
-# --- Exec ---
-CMD="${*:-/bin/bash}"
-exec sudo -u agent --preserve-env=HTTP_PROXY,HTTPS_PROXY,http_proxy,https_proxy,NO_PROXY,no_proxy \
-    env HOME=/home/agent \
-    bash -c "cd /workspace && $CMD"
-ENTRYPOINT
+PI_SETUP
+)" standard
 
     # ========================================================================
     # GEMINI IMAGE
@@ -446,37 +342,7 @@ archive.ubuntu.com
 security.ubuntu.com
 DOMAINS
 
-    cat > "${BUILD_DIR}/gemini/entrypoint.sh" << 'ENTRYPOINT'
-#!/bin/bash
-# --- Network mode selection (validated; fail closed) ---
-case "${SANDBOX_NETWORK:-locked}" in
-    locked) SQUID_CONF=/etc/squid-locked.conf  ; NFT_CONF=/etc/nftables-locked.conf ;;
-    open)   SQUID_CONF=/etc/squid-open.conf    ; NFT_CONF=/etc/nftables-open.conf ;;
-    *)      echo "[entrypoint] FATAL: invalid SANDBOX_NETWORK='${SANDBOX_NETWORK}'" >&2
-            echo "[entrypoint] Must be 'locked' or 'open'. Refusing to start." >&2
-            exit 1 ;;
-esac
-
-# --- Squid proxy ---
-mkdir -p /run/squid /var/log/squid
-chown proxy:proxy /run/squid /var/log/squid
-squid -f "$SQUID_CONF" -z --foreground 2>/dev/null || true
-squid -f "$SQUID_CONF" -NYC &
-SQUID_PID=$!
-
-SQUID_READY=0
-for _ in $(seq 1 30); do
-    if curl -sf -o /dev/null --proxy http://127.0.0.1:3128 http://ports.ubuntu.com 2>/dev/null; then
-        SQUID_READY=1
-        break
-    fi
-    sleep 0.2
-done
-[ "$SQUID_READY" -eq 0 ] && echo "[entrypoint] WARNING: squid did not become reachable in 6s — network access may be broken" >&2
-
-# --- nftables ---
-nft -f "$NFT_CONF" 2>/dev/null || true
-
+    write_entrypoint "${BUILD_DIR}/gemini/entrypoint.sh" gemini "$(cat << 'GEMINI_SETUP'
 # --- Gemini config persistence ---
 if [ -d /home/agent/.gemini ]; then
     chown -R agent:agent /home/agent/.gemini
@@ -488,33 +354,8 @@ mkdir -p /home/agent/.local/share
 rm -rf /home/agent/.local/share/keyrings
 ln -sf /home/agent/.gemini/keyrings /home/agent/.local/share/keyrings
 chown -R agent:agent /home/agent/.local /home/agent/.gemini/keyrings
-
-# --- Prompt (visual indicator for open mode; user can override) ---
-COLORS=(31 32 33 34 35 36 91 92 93 94 95 96)
-CLR=${COLORS[$((RANDOM % ${#COLORS[@]}))]}
-NETMODE_TAG=""
-if [ "${SANDBOX_NETWORK:-locked}" = "open" ]; then
-    NETMODE_TAG="\\[\\033[1;31m\\][OPEN]\\[\\033[0m\\] "
-fi
-echo "# SANDBOX_NETWORK=${SANDBOX_NETWORK:-locked} — override PS1 below to taste" \
-    >> /home/agent/.bashrc
-echo "PS1='${NETMODE_TAG}\\[\\033[1;${CLR}m\\]gemini@\\h\\[\\033[0m\\]:\\[\\033[1;34m\\]\\w\\[\\033[0m\\]\\$ '" \
-    >> /home/agent/.bashrc
-echo "export SANDBOX_NETWORK=${SANDBOX_NETWORK:-locked}" >> /home/agent/.bashrc
-
-# --- Shutdown ---
-cleanup() { kill "$SQUID_PID" 2>/dev/null; wait "$SQUID_PID" 2>/dev/null; exit 0; }
-trap cleanup SIGTERM SIGINT
-
-# --- Exec (dbus-run-session for gnome-keyring / libsecret) ---
-CMD="${*:-/bin/bash}"
-exec sudo -u agent --preserve-env=HTTP_PROXY,HTTPS_PROXY,http_proxy,https_proxy,NO_PROXY,no_proxy \
-    env HOME=/home/agent \
-    dbus-run-session -- bash -c '
-        echo "" | gnome-keyring-daemon --unlock --components=secrets >/dev/null 2>&1
-        cd /workspace && '"$CMD"'
-    '
-ENTRYPOINT
+GEMINI_SETUP
+)" dbus
 
     ok "Build context written to ${BUILD_DIR}"
 }

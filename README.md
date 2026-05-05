@@ -447,4 +447,4 @@ Non-obvious things that influenced the design.
 
 ## License
 
-MIT — see `LICENSE`. The third-party agent CLIs this tool wraps (Claude Code, pi-coding-agent, gemini-cli) have their own licenses; check those separately before redistribution.
+MIT — see `LICENSE`.

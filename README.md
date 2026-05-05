@@ -33,7 +33,7 @@ This sandbox constrains all three vectors:
 |---|---|---|
 | macOS | 26.x (Apple Silicon) | Should work on Intel Macs; Linux works partially (see Troubleshooting) |
 | Podman | 5.8.1 | Install via `brew install podman` |
-| Podman machine | initialized with `--rosetta` (macOS) | `podman machine init --rosetta && podman machine start` |
+| Podman machine | - | `podman machine init && podman machine start` |
 | Disk | ~3 GB | Base image ~600 MB, three agent images share most layers |
 | RAM | 4 GB free per concurrent sandbox | Each container runs squid + the agent CLI |
 

@@ -416,14 +416,35 @@ cmd_setup() {
 }
 
 cmd_update() {
-    local target="${1:-}"
-    require_podman
+    local target="" prune=0
+
+    # Parse flags. --prune opts in to dangling-image cleanup after rebuild.
+    # Default is to warn-only so the command never removes anything the user
+    # didn't explicitly ask to remove.
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --prune)    prune=1; shift ;;
+            --no-prune) prune=0; shift ;;
+            -*)         err "Unknown flag: $1"; exit 1 ;;
+            *)
+                if [ -z "$target" ]; then
+                    target="$1"
+                else
+                    err "Multiple update targets given: '$target' and '$1'"
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
 
     if [ -z "$target" ]; then
-        err "Usage: $(basename "$0") update <agent|all>"
+        err "Usage: $(basename "$0") update <agent|all> [--prune]"
         echo "  Agents: $KNOWN_AGENTS"
         exit 1
     fi
+
+    require_podman
 
     local agents_to_update
     if [ "$target" = "all" ]; then
@@ -459,6 +480,20 @@ cmd_update() {
             done
         fi
     done
+
+    # Dangling images: the --no-cache rebuild above leaves the previous image
+    # untagged but still on disk. With --prune, clean them up; otherwise just
+    # report so the user knows space can be reclaimed.
+    local dangling_count
+    dangling_count=$(podman images --filter dangling=true -q 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$dangling_count" -gt 0 ]; then
+        if [ "$prune" -eq 1 ]; then
+            log "Pruning ${dangling_count} dangling image(s)..."
+            podman image prune -f
+        else
+            warn "${dangling_count} dangling image(s) on system — run with --prune to reclaim space"
+        fi
+    fi
 }
 
 cmd_teardown() {
@@ -777,7 +812,8 @@ Network modes:
 
 Management:
   $(basename "$0") setup                       Build all images and create volumes + symlinks
-  $(basename "$0") update <agent|all>          Rebuild agent image(s) with latest package
+  $(basename "$0") update <agent|all> [--prune] Rebuild agent image(s) with latest package
+                                              (--prune removes dangling images afterwards)
   $(basename "$0") status                      Show sandbox component status
   $(basename "$0") teardown <name|path>        Remove containers for a project
   $(basename "$0") teardown all                Remove everything
@@ -800,7 +836,7 @@ case "${1:-}" in
         cmd_setup
         ;;
     update)
-        cmd_update "${2:-}"
+        cmd_update "${@:2}"
         ;;
     teardown)
         cmd_teardown "${2:-}"

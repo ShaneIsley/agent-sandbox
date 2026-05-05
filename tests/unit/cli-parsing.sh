@@ -84,3 +84,26 @@ assert_rc "validate_agent claude → 0"  0 validate_agent claude
 assert_rc "validate_agent pi → 0"      0 validate_agent pi
 assert_rc "validate_agent gemini → 0"  0 validate_agent gemini
 assert_rc "validate_agent bogus → 1"   1 validate_agent bogus
+
+# ── cmd_update flag parsing ─────────────────────────────────────────────────
+# These tests exercise cmd_update's early-exit paths: bad flag, multiple
+# targets, and missing target. All three exit before require_podman fires,
+# so they run cleanly in a host without podman.
+section "cmd_update flag parsing — early-exit paths"
+assert_rc "cmd_update with no args → exit 1 (missing target)" \
+    1 cmd_update
+assert_rc "cmd_update --prune (no positional) → exit 1 (missing target)" \
+    1 cmd_update --prune
+assert_rc "cmd_update --bogus → exit 1 (unknown flag)" \
+    1 cmd_update --bogus
+assert_rc "cmd_update foo bar → exit 1 (multiple targets)" \
+    1 cmd_update foo bar
+assert_rc "cmd_update foo --prune bar → exit 1 (multiple targets after flag)" \
+    1 cmd_update foo --prune bar
+
+assert_stderr_contains "missing-target error mentions Usage" \
+    "Usage:" cmd_update --prune
+assert_stderr_contains "unknown-flag error names the flag" \
+    "--bogus" cmd_update --bogus
+assert_stderr_contains "multiple-targets error names both" \
+    "foo" cmd_update foo bar

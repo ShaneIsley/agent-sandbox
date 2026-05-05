@@ -947,6 +947,13 @@ Or use --agent directly:
 EOF
 }
 
+# When sourced (not executed), expose functions for testing without running
+# the dispatcher below. ${BASH_SOURCE[0]} is this file; $0 is the entry script.
+# Equal → script was executed; unequal → it was sourced.
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+    return 0
+fi
+
 case "${1:-}" in
     setup)
         cmd_setup
